@@ -41,17 +41,28 @@
 
 extern crate parking_lot;
 extern crate owning_ref;
+extern crate crossbeam_utils;
 
 #[cfg(test)]
 mod tests;
 
-use owning_ref::{OwningHandle, OwningRef};
+use crossbeam_utils::sync::{self, ShardedLock};
+use owning_ref::{StableAddress, OwningHandle, OwningRef};
 use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::collections::hash_map;
 use std::hash::{Hash, Hasher, BuildHasher};
 use std::sync::atomic::{self, AtomicUsize};
 use std::{mem, ops, cmp, fmt, iter};
 use std::borrow::Borrow;
+
+struct ShardedLockReadGuard<'a, K>(sync::ShardedLockReadGuard<'a, K>);
+impl<'a, K> ops::Deref for ShardedLockReadGuard<'a, K>{
+    type Target = <sync::ShardedLockReadGuard<'a, K> as ops::Deref>::Target;
+    fn deref(&self) -> &<Self as ops::Deref>::Target {
+        &self.0
+    }
+}
+unsafe impl<'a, K> StableAddress for ShardedLockReadGuard<'a, K> {}
 
 /// The atomic ordering used throughout the code.
 const ORDERING: atomic::Ordering = atomic::Ordering::Relaxed;
@@ -337,9 +348,9 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
     ///
     /// This searches some key `key`, and returns a immutable lock guard to its bucket. If the key
     /// couldn't be found, the returned value will be an `Empty` cluster.
-    fn lookup<Q: ?Sized>(&self, key: &Q) -> RwLockReadGuard<Bucket<K, V>> 
-        where 
-            K: Borrow<Q>, 
+    fn lookup<Q: ?Sized>(&self, key: &Q) -> RwLockReadGuard<Bucket<K, V>>
+        where
+            K: Borrow<Q>,
             Q: PartialEq + Hash {
         self.scan(key, |x| match *x {
             // We'll check that the keys does indeed match, as the chance of hash collisions
@@ -358,9 +369,9 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
     ///
     /// Replacing at this bucket is safe as the bucket will be in the same cluster of buckets as
     /// the first priority cluster.
-    fn lookup_mut<Q: ?Sized>(&self, key: &Q) -> RwLockWriteGuard<Bucket<K, V>> 
-        where 
-            K: Borrow<Q>, 
+    fn lookup_mut<Q: ?Sized>(&self, key: &Q) -> RwLockWriteGuard<Bucket<K, V>>
+        where
+            K: Borrow<Q>,
             Q: PartialEq + Hash {
         self.scan_mut(key, |x| match *x {
             // We'll check that the keys does indeed match, as the chance of hash collisions
@@ -489,7 +500,7 @@ impl<K, V> IntoIterator for Table<K, V> {
 /// on drop.
 pub struct ReadGuard<'a, K: 'a, V: 'a> {
     /// The inner hecking long type.
-    inner: OwningRef<OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>, V>,
+    inner: OwningRef<OwningHandle<ShardedLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>, V>,
 }
 
 impl<'a, K, V> ops::Deref for ReadGuard<'a, K, V> {
@@ -519,7 +530,7 @@ impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for ReadGuard<'a, K, V> {
 /// on drop.
 pub struct WriteGuard<'a, K: 'a, V: 'a> {
     /// The inner hecking long type.
-    inner: OwningHandle<OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockWriteGuard<'a, Bucket<K, V>>>, &'a mut V>,
+    inner: OwningHandle<OwningHandle<ShardedLockReadGuard<'a, Table<K, V>>, RwLockWriteGuard<'a, Bucket<K, V>>>, &'a mut V>,
 }
 
 impl<'a, K, V> ops::Deref for WriteGuard<'a, K, V> {
@@ -561,7 +572,7 @@ impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for WriteGuard<'a, K, V> {
 /// cases, due to limitations on in-place operations on values.
 pub struct CHashMap<K, V> {
     /// The inner table.
-    table: RwLock<Table<K, V>>,
+    table: ShardedLock<Table<K, V>>,
     /// The total number of KV pairs in the table.
     ///
     /// This is used to calculate the load factor.
@@ -578,7 +589,7 @@ impl<K, V> CHashMap<K, V> {
             // Start at 0 KV pairs.
             len: AtomicUsize::new(0),
             // Make a new empty table. We will make sure that it is at least one.
-            table: RwLock::new(Table::with_capacity(cap)),
+            table: ShardedLock::new(Table::with_capacity(cap)),
         }
     }
 
@@ -611,7 +622,7 @@ impl<K, V> CHashMap<K, V> {
     /// from capacity, in the sense that the map cannot hold this number of entries, since it needs
     /// to keep the load factor low.
     pub fn buckets(&self) -> usize {
-        self.table.read().buckets.len()
+        self.table.read().unwrap().buckets.len()
     }
 
     /// Is the hash table empty?
@@ -626,10 +637,10 @@ impl<K, V> CHashMap<K, V> {
     /// It is relatively efficient, although it needs to write lock a RW lock.
     pub fn clear(&self) -> CHashMap<K, V> {
         // Acquire a writable lock.
-        let mut lock = self.table.write();
+        let mut lock = self.table.write().unwrap();
         CHashMap {
             // Replace the old table with an empty initial table.
-            table: RwLock::new(mem::replace(&mut *lock, Table::new(DEFAULT_INITIAL_CAPACITY))),
+            table: ShardedLock::new(mem::replace(&mut *lock, Table::new(DEFAULT_INITIAL_CAPACITY))),
             // Replace the length with 0 and use the old length.
             len: AtomicUsize::new(self.len.swap(0, ORDERING)),
         }
@@ -654,7 +665,7 @@ impl<K, V> CHashMap<K, V> {
     pub fn retain<F>(&self, predicate: F)
     where F: Fn(&K, &V) -> bool {
         // Acquire the read lock to the table.
-        let table = self.table.read();
+        let table = self.table.read().unwrap();
         // Run over every bucket and apply the filter.
         for bucket in &table.buckets {
             // Acquire the read lock, which we will upgrade if necessary.
@@ -677,7 +688,7 @@ impl<K, V> CHashMap<K, V> {
         }
     }
 }
-  
+
 impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// Get the value of some key.
     ///
@@ -689,7 +700,9 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
               Q: Hash + PartialEq {
         // Acquire the read lock and lookup in the table.
         if let Ok(inner) = OwningRef::new(
-            OwningHandle::new_with_fn(self.table.read(), |x| unsafe { &*x }.lookup(key))
+            OwningHandle::new_with_fn(
+                ShardedLockReadGuard(self.table.read().unwrap()),
+                |x| unsafe { &*x }.lookup(key))
         ).try_map(|x| x.value_ref()) {
             // The bucket contains data.
             Some(ReadGuard {
@@ -707,12 +720,12 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// This will lookup the entry of some key `key`, and acquire the writable lock. This means
     /// that all other parties are blocked from both reading and writing this value while the guard
     /// is held.
-    pub fn get_mut<Q: ?Sized>(&self, key: &Q) -> Option<WriteGuard<K, V>> 
+    pub fn get_mut<Q: ?Sized>(&self, key: &Q) -> Option<WriteGuard<K, V>>
         where K: Borrow<Q>,
               Q: Hash + PartialEq {
         // Acquire the write lock and lookup in the table.
         if let Ok(inner) = OwningHandle::try_new(OwningHandle::new_with_fn(
-            self.table.read(),
+            ShardedLockReadGuard(self.table.read().unwrap()),
             |x| unsafe { &*x }.lookup_mut(key)),
             |x| {
                 if let &mut Bucket::Contains(_, ref mut val) = unsafe {
@@ -733,11 +746,11 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     }
 
     /// Does the hash map contain this key?
-    pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool 
+    pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool
         where K: Borrow<Q>,
               Q: Hash + PartialEq{
         // Acquire the lock.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
         // Look the key up in the table
         let bucket = lock.lookup(key);
         // Test if it is free or not.
@@ -773,7 +786,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                       the assumptions about `insert_new`'s arguments.");
 
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
         {
             // Find the free bucket.
             let mut bucket = lock.find_free(&key);
@@ -792,7 +805,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     pub fn insert(&self, key: K, val: V) -> Option<V> {
         let ret;
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
         {
             // Lookup the key or a free bucket in the inner table.
             let mut bucket = lock.lookup_or_free(&key);
@@ -819,7 +832,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         G: FnOnce(&mut V),
     {
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
         {
             // Lookup the key or a free bucket in the inner table.
             let mut bucket = lock.lookup_or_free(&key);
@@ -852,7 +865,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     pub fn alter<F>(&self, key: K, f: F)
     where F: FnOnce(Option<V>) -> Option<V> {
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
         {
             // Lookup the key or a free bucket in the inner table.
             let mut bucket = lock.lookup_or_free(&key);
@@ -886,12 +899,12 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     ///
     /// This removes and returns the entry with key `key`. If no entry with said key exists, it
     /// will simply return `None`.
-    pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<V> 
-        where 
-            K: Borrow<Q>, 
+    pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<V>
+        where
+            K: Borrow<Q>,
             Q: PartialEq + Hash {
         // Acquire the read lock of the table.
-        let lock = self.table.read();
+        let lock = self.table.read().unwrap();
 
         // Lookup the table, mutably.
         let mut bucket = lock.lookup_mut(&key);
@@ -919,7 +932,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         // Get the new length.
         let len = self.len() + additional;
         // Acquire the write lock (needed because we'll mess with the table).
-        let mut lock = self.table.write();
+        let mut lock = self.table.write().unwrap();
         // Handle the case where another thread has resized the table while we were acquiring the
         // lock.
         if lock.buckets.len() < len * LENGTH_MULTIPLIER {
@@ -940,7 +953,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// has a high maximum case).
     pub fn shrink_to_fit(&self) {
         // Acquire the write lock (needed because we'll mess with the table).
-        let mut lock = self.table.write();
+        let mut lock = self.table.write().unwrap();
         // Swap the table out with a new table of desired size (multiplied by some factor).
         let table = mem::replace(&mut *lock, Table::with_capacity(self.len()));
         // Fill the new table with the data from the old table.
@@ -950,7 +963,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// Increment the size of the hash map and expand it so one more entry can fit in.
     ///
     /// This returns the read lock, such that the caller won't have to acquire it twice.
-    fn expand(&self, lock: RwLockReadGuard<Table<K, V>>) {
+    fn expand(&self, lock: sync::ShardedLockReadGuard<Table<K, V>>) {
         // Increment the length to take the new element into account.
         let len = self.len.fetch_add(1, ORDERING) + 1;
 
@@ -974,7 +987,7 @@ impl<K, V> Default for CHashMap<K, V> {
 impl<K: Clone, V: Clone> Clone for CHashMap<K, V> {
     fn clone(&self) -> CHashMap<K, V> {
         CHashMap {
-            table: RwLock::new(self.table.read().clone()),
+            table: ShardedLock::new(self.table.read().unwrap().clone()),
             len: AtomicUsize::new(self.len.load(ORDERING)),
         }
     }
@@ -982,7 +995,7 @@ impl<K: Clone, V: Clone> Clone for CHashMap<K, V> {
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for CHashMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        (*self.table.read()).fmt(f)
+        (*self.table.read().unwrap()).fmt(f)
     }
 }
 
@@ -991,7 +1004,7 @@ impl<K, V> IntoIterator for CHashMap<K, V> {
     type IntoIter = IntoIter<K, V>;
 
     fn into_iter(self) -> IntoIter<K, V> {
-        self.table.into_inner().into_iter()
+        self.table.into_inner().unwrap().into_iter()
     }
 }
 
@@ -1012,7 +1025,7 @@ impl<K: PartialEq + Hash, V> iter::FromIterator<(K, V)> for CHashMap<K, V> {
         }
 
         CHashMap {
-            table: RwLock::new(table),
+            table: ShardedLock::new(table),
             len: AtomicUsize::new(len),
         }
     }

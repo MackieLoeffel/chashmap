@@ -12,6 +12,7 @@ exclude = ["target", "Cargo.lock"]
 [dependencies]
 parking_lot = "0.7"
 owning_ref = "0.4"
+crossbeam-utils = "0.6"
 
 [features]
 nightly = [ "parking_lot/nightly" ]
